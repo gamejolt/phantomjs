@@ -17,11 +17,7 @@ var npmconf = require('npmconf')
 var path = require('path')
 var request = require('request')
 var url = require('url')
-var util = require('util')
 var which = require('which')
-
-var cdnUrl = process.env.npm_config_phantomjs_cdnurl || process.env.PHANTOMJS_CDNURL || 'https://github.com/gamejolt/phantomjs/releases/download/v' + helper.version + '-0'
-var downloadUrl = cdnUrl + '/phantomjs-' + helper.version + '-'
 
 var originalPath = process.env.PATH
 
@@ -45,6 +41,8 @@ var pkgPath = path.join(libPath, 'phantom')
 var phantomPath = null
 var tmpPath = null
 
+var npmConfPromise = kew.nfcall(npmconf.load)
+
 // If the user manually installed PhantomJS, we want
 // to use the existing version.
 //
@@ -56,77 +54,12 @@ var tmpPath = null
 // local versions and global versions.
 // https://github.com/Obvious/phantomjs/issues/85
 // https://github.com/Medium/phantomjs/pull/184
-var whichDeferred = kew.defer()
-which('phantomjs', whichDeferred.makeNodeResolver())
-whichDeferred.promise
-  .then(function (result) {
-    phantomPath = result
-
-    // Horrible hack to avoid problems during global install. We check to see if
-    // the file `which` found is our own bin script.
-    if (phantomPath.indexOf(path.join('npm', 'phantomjs')) !== -1) {
-      console.log('Looks like an `npm install -g` on windows; unable to check for already installed version.')
-      throw new Error('Global install')
-    }
-
-    var contents = fs.readFileSync(phantomPath, 'utf8')
-    if (/NPM_INSTALL_MARKER/.test(contents)) {
-      console.log('Looks like an `npm install -g`; unable to check for already installed version.')
-      throw new Error('Global install')
-    } else {
-      var checkVersionDeferred = kew.defer()
-      cp.execFile(phantomPath, ['--version'], checkVersionDeferred.makeNodeResolver())
-      return checkVersionDeferred.promise
-    }
+kew.resolve(true)
+  .then(function () {
+    return tryPhantomjsOnPath()
   })
-  .then(function (stdout) {
-    var version = stdout.trim()
-    if (helper.version == version) {
-      writeLocationFile(phantomPath);
-      console.log('PhantomJS is already installed at', phantomPath + '.')
-      exit(0)
-
-    } else {
-      console.log('PhantomJS detected, but wrong version', stdout.trim(), '@', phantomPath + '.')
-      throw new Error('Wrong version')
-    }
-  })
-  .fail(function (err) {
-    // Trying to use a local file failed, so initiate download and install
-    // steps instead.
-    var npmconfDeferred = kew.defer()
-    npmconf.load(npmconfDeferred.makeNodeResolver())
-    return npmconfDeferred.promise
-  })
-  .then(function (conf) {
-    tmpPath = findSuitableTempDirectory(conf)
-
-    // Can't use a global version so start a download.
-    if (process.platform === 'linux' && process.arch === 'x64') {
-      downloadUrl += 'linux-x86_64.tar.bz2'
-    } else if (process.platform === 'linux') {
-      downloadUrl += 'linux-i686.tar.bz2'
-    } else if (process.platform === 'darwin' || process.platform === 'openbsd' || process.platform === 'freebsd') {
-      downloadUrl += 'macosx.zip'
-    } else if (process.platform === 'win32') {
-      downloadUrl += 'windows.zip'
-    } else {
-      console.error('Unexpected platform or architecture:', process.platform, process.arch)
-      exit(1)
-    }
-
-    var fileName = downloadUrl.split('/').pop()
-    var downloadedFile = path.join(tmpPath, fileName)
-
-    // Start the install.
-    if (!fs.existsSync(downloadedFile)) {
-      console.log('Downloading', downloadUrl)
-      console.log('Saving to', downloadedFile)
-      return requestBinary(getRequestOptions(conf), downloadedFile)
-    } else {
-      console.log('Download already available at', downloadedFile)
-      return downloadedFile
-    }
+  .then(function () {
+    return downloadPhantomjs()
   })
   .then(function (downloadedFile) {
     return extractDownload(downloadedFile)
@@ -138,11 +71,20 @@ whichDeferred.promise
     var location = process.platform === 'win32' ?
         path.join(pkgPath, 'phantomjs.exe') :
         path.join(pkgPath, 'phantomjs')
+
+    try {
+      // Ensure executable is executable by all users
+      fs.chmodSync(location, '755')
+    } catch (err) {
+      if (err.code == 'ENOENT') {
+        console.error('chmod failed: phantomjs was not successfully copied to', location)
+        exit(1)
+      }
+      throw err
+    }
+
     var relativeLocation = path.relative(libPath, location)
     writeLocationFile(relativeLocation)
-
-    // Ensure executable is executable by all users
-    fs.chmodSync(location, '755')
 
     console.log('Done. Phantomjs binary available at', location)
     exit(0)
@@ -210,7 +152,7 @@ function getRequestOptions(conf) {
 
 
   var options = {
-    uri: downloadUrl,
+    uri: getDownloadUrl(),
     encoding: null, // Get response as a buffer
     followRedirect: true, // The default download path redirects to a CDN URL.
     headers: {},
@@ -231,8 +173,15 @@ function getRequestOptions(conf) {
     // Enable proxy
     options.proxy = proxyUrl
 
-    // If going through proxy, spoof the User-Agent, since may commerical proxies block blank or unknown agents in headers
-    options.headers['User-Agent'] = 'curl/7.21.4 (universal-apple-darwin11.0) libcurl/7.21.4 OpenSSL/0.9.8r zlib/1.2.5'
+    // If going through proxy, use the user-agent string from the npm config
+    options.headers['User-Agent'] = conf.get('user-agent')
+  }
+
+  // Use certificate authority settings from npm
+  var ca = conf.get('ca')
+  if (ca) {
+    console.log('Using npmconf ca')
+    options.ca = ca
   }
 
   return options
@@ -242,15 +191,12 @@ function getRequestOptions(conf) {
 function requestBinary(requestOptions, filePath) {
   var deferred = kew.defer()
 
-  var count = 0
-  var notifiedCount = 0
   var writePath = filePath + '-download-' + Date.now()
-  var outFile = fs.openSync(writePath, 'w')
 
   console.log('Receiving...')
   var bar = null
   requestProgress(request(requestOptions, function (error, response, body) {
-    console.log('');
+    console.log('')
     if (!error && response.statusCode === 200) {
       fs.writeFileSync(writePath, body)
       console.log('Received ' + Math.floor(body.length / 1024) + 'K total.')
@@ -316,7 +262,7 @@ function extractDownload(filePath) {
 
   } else {
     console.log('Extracting tar contents (via spawned process)')
-    cp.execFile('tar', ['jxf', filePath], options, function (err, stdout, stderr) {
+    cp.execFile('tar', ['jxf', filePath], options, function (err) {
       if (err) {
         console.error('Error extracting archive')
         deferred.reject(err)
@@ -344,5 +290,117 @@ function copyIntoPlace(extractedPath, targetPath) {
 
     console.log('Could not find extracted file', files)
     throw new Error('Could not find extracted file')
+  })
+}
+
+/**
+ * Check to see if the binary on PATH is OK to use. If successful, exit the process.
+ */
+function tryPhantomjsOnPath() {
+  return kew.nfcall(which, 'phantomjs')
+  .then(function (result) {
+    phantomPath = result
+
+    // Horrible hack to avoid problems during global install. We check to see if
+    // the file `which` found is our own bin script.
+    if (phantomPath.indexOf(path.join('npm', 'phantomjs')) !== -1) {
+      console.log('Looks like an `npm install -g` on windows; unable to check for already installed version.')
+      return
+    }
+
+    var contents = fs.readFileSync(phantomPath, 'utf8')
+    if (/NPM_INSTALL_MARKER/.test(contents)) {
+      console.log('Looks like an `npm install -g`; unable to check for already installed version.')
+    } else {
+      return checkPhantomjsVersion(phantomPath).then(function (matches) {
+        if (matches) {
+          writeLocationFile(phantomPath)
+          console.log('PhantomJS is already installed at', phantomPath + '.')
+          exit(0)
+        }
+      })
+    }
+  }, function () {
+    console.log('PhantomJS not found on PATH')
+  })
+  .fail(function (err) {
+    console.error('Error checking path, continuing', err)
+    return false
+  })
+}
+
+/**
+ * @return {?string} Get the download URL for phantomjs. May return null if no download url exists.
+ */
+function getDownloadUrl() {
+  var cdnUrl = process.env.npm_config_phantomjs_cdnurl ||
+      process.env.PHANTOMJS_CDNURL ||
+      'https://github.com/gamejolt/phantomjs/releases/download/v' + helper.version + '-0'
+  var downloadUrl = cdnUrl + '/phantomjs-' + helper.version + '-'
+
+  if (process.platform === 'linux' && process.arch === 'x64') {
+    downloadUrl += 'linux-x86_64.tar.bz2'
+  } else if (process.platform === 'linux' && process.arch == 'ia32') {
+    downloadUrl += 'linux-i686.tar.bz2'
+  } else if (process.platform === 'darwin' || process.platform === 'openbsd' || process.platform === 'freebsd') {
+    downloadUrl += 'macosx.zip'
+  } else if (process.platform === 'win32') {
+    downloadUrl += 'windows.zip'
+  } else {
+    return null
+  }
+  return downloadUrl
+}
+
+/**
+ * Download phantomjs, reusing the existing copy on disk if available.
+ * Exits immediately if there is no binary to download.
+ */
+function downloadPhantomjs() {
+  var downloadUrl = getDownloadUrl()
+  if (!downloadUrl) {
+    console.error(
+        'Unexpected platform or architecture: ' + process.platform + '/' + process.arch + '\n' +
+        'It seems there is no binary available for your platform/architecture\n' +
+        'Try to install PhantomJS globally')
+    exit(1)
+  }
+
+  return npmConfPromise.then(function (conf) {
+    tmpPath = findSuitableTempDirectory(conf)
+
+    // Can't use a global version so start a download.
+    var fileName = downloadUrl.split('/').pop()
+    var downloadedFile = path.join(tmpPath, fileName)
+
+    // Start the install.
+    if (!fs.existsSync(downloadedFile)) {
+      console.log('Downloading', downloadUrl)
+      console.log('Saving to', downloadedFile)
+      return requestBinary(getRequestOptions(conf), downloadedFile)
+    } else {
+      console.log('Download already available at', downloadedFile)
+      return downloadedFile
+    }
+  })
+}
+
+/**
+ * Check to make sure a given binary is the right version.
+ * @return {kew.Promise.<boolean>}
+ */
+function checkPhantomjsVersion(phantomPath) {
+  console.log('Found PhantomJS at', phantomPath, '...verifying')
+  return kew.nfcall(cp.execFile, phantomPath, ['--version']).then(function (stdout) {
+    var version = stdout.trim()
+    if (helper.version == version) {
+      return true
+    } else {
+      console.log('PhantomJS detected, but wrong version', stdout.trim(), '@', phantomPath + '.')
+      return false
+    }
+  }).fail(function (err) {
+    console.error('Error verifying phantomjs, continuing', err)
+    return false
   })
 }
