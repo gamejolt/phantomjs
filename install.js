@@ -20,7 +20,7 @@ var url = require('url')
 var util = require('util')
 var which = require('which')
 
-var cdnUrl = process.env.npm_config_phantomjs_cdnurl || process.env.PHANTOMJS_CDNURL ||  'https://bitbucket.org/ariya/phantomjs/downloads'
+var cdnUrl = process.env.npm_config_phantomjs_cdnurl || process.env.PHANTOMJS_CDNURL || 'https://github.com/gamejolt/phantomjs/releases/download/v' + helper.version + '-0'
 var downloadUrl = cdnUrl + '/phantomjs-' + helper.version + '-'
 
 var originalPath = process.env.PATH
